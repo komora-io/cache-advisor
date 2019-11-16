@@ -1,0 +1,18 @@
+[package]
+name = "berghain"
+version = "0.0.1-preview"
+authors = ["Tyler Neely <t@jujit.su>"]
+description = "a high performance cache with an admisison policy based on TinyLFU"
+license = "MIT/Apache-2.0"
+homepage = "https://github.com/spacejam/berghain"
+repository = "https://github.com/spacejam/berghain"
+keywords = ["cache", "lfu", "concurrent", "caching", "lock-free"]
+categories = ["caching", "database-implementations", "concurrency", "data-structures", "algorithms"]
+documentation = "https://docs.rs/berghain/"
+readme = "README.md"
+edition = "2018"
+
+[profile.release]
+debug = true
+opt-level = 3
+[dependencies]
