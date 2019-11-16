@@ -2,7 +2,7 @@
 name = "berghain"
 version = "0.0.1-preview"
 authors = ["Tyler Neely <t@jujit.su>"]
-description = "a high performance cache with an admisison policy based on TinyLFU"
+description = "the hottest cache with an admisison policy based on TinyLFU"
 license = "MIT/Apache-2.0"
 homepage = "https://github.com/spacejam/berghain"
 repository = "https://github.com/spacejam/berghain"
