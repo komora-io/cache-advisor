@@ -1,18 +1,22 @@
 [package]
 name = "berghain"
-version = "0.0.1-preview"
-authors = ["Tyler Neely <t@jujit.su>"]
-description = "the hottest cache with an admisison policy based on TinyLFU"
-license = "MIT/Apache-2.0"
-homepage = "https://github.com/spacejam/berghain"
-repository = "https://github.com/spacejam/berghain"
+version = "0.0.1"
+authors = ["Tyler Neely <tylerneely@gmail.com>"]
+description = "scan resistant concurrent cache eviction manager"
+license = "GPL-3.0"
+homepage = "https://github.com/komora-io/berghain"
+repository = "https://github.com/komora-io/berghain"
 keywords = ["cache", "lfu", "concurrent", "caching", "lock-free"]
 categories = ["caching", "database-implementations", "concurrency", "data-structures", "algorithms"]
 documentation = "https://docs.rs/berghain/"
 readme = "README.md"
-edition = "2018"
+edition = "2021"
+
+[features]
+lock_free_delays = []
 
 [profile.release]
 debug = true
 opt-level = 3
 [dependencies]
+ebr = "0.0.5"
