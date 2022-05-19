@@ -65,7 +65,6 @@ fn probabilistic_size(input: usize) -> u8 {
 }
 
 fn probabilistic_unsize(input: u8) -> usize {
-    println!("input: {}", input);
     1 << input
 }
 
@@ -338,13 +337,13 @@ impl CacheAccess {
 
 /// A simple eviction manager.
 #[derive(Clone)]
-pub struct Bouncer {
+pub struct CacheEvictor {
     shards: Arc<[(AccessQueue, Mutex<Shard>)]>,
     ebr: Ebr<Box<AccessBlock>>,
 }
 
-impl Bouncer {
-    /// Instantiates a new `Bouncer` eviction manager.
+impl CacheEvictor {
+    /// Instantiates a new `CacheEvictor` eviction manager.
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity >= N_SHARDS,
@@ -370,7 +369,7 @@ impl Bouncer {
     /// Called when an item is accessed. Returns a Vec of items to be
     /// evicted. Uses flat-combining to avoid blocking on what can
     /// be an asynchronous operation.
-    pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<PageId> {
+    pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<(u64, usize)> {
         let guard = self.ebr.pin();
 
         let shards = N_SHARDS as u64;
@@ -390,9 +389,10 @@ impl Bouncer {
                 for item in accesses {
                     let to_evict = shard.accessed(item);
                     // map shard internal offsets to global items ids
-                    for pos in to_evict {
-                        let item = (PageId::from(pos) << SHARD_BITS) + shard_idx;
-                        ret.push(item);
+                    for cache_access in to_evict {
+                        let item = cache_access.pid(u8::try_from(shard_idx).unwrap());
+                        let size = cache_access.size();
+                        ret.push((item, size));
                     }
                 }
             }
@@ -474,7 +474,7 @@ impl Shard {
     }
 
     /// `PageId`s in the shard list are indexes of the entries.
-    fn accessed(&mut self, cache_access: CacheAccess) -> Vec<PageId> {
+    fn accessed(&mut self, cache_access: CacheAccess) -> Vec<CacheAccess> {
         let new_size = cache_access.size();
 
         if let Some(entry) = self.entries.get(cache_access.pid_bytes()) {
@@ -509,13 +509,12 @@ impl Shard {
 
             let node: Box<Node> = self.dll.pop_tail().unwrap();
             let pid_bytes = node.pid_bytes();
-            let shard_u8: u8 = self.shard_idx.try_into().unwrap();
-            let pid = node.pid(shard_u8);
             let node_size = node.size();
+            let cache_access: CacheAccess = unsafe { *node.inner.get() };
 
             assert!(self.entries.remove(pid_bytes));
 
-            to_evict.push(pid);
+            to_evict.push(cache_access);
 
             self.size -= node_size;
 
@@ -534,7 +533,7 @@ impl Shard {
 
 #[test]
 fn lru_smoke_test() {
-    let mut lru = Bouncer::new(2);
+    let mut lru = CacheEvictor::new(2);
     for i in 0..1000 {
         lru.accessed(i, 16);
     }
@@ -542,24 +541,34 @@ fn lru_smoke_test() {
 
 #[test]
 fn lru_access_test() {
-    let ci = CacheAccess::new(6, 20667);
+    let size = 20667;
+    let ci = CacheAccess::new(6, size);
     assert_eq!(ci.size(), 32 * 1024);
 
-    let mut lru = Bouncer::new(4096);
+    let mut lru = CacheEvictor::new(4096);
 
-    assert_eq!(lru.accessed(0, 20667,), vec![]);
-    assert_eq!(lru.accessed(2, 20667,), vec![]);
-    assert_eq!(lru.accessed(4, 20667,), vec![]);
-    assert_eq!(lru.accessed(6, 20667,), vec![]);
-    assert_eq!(lru.accessed(8, 20667,), vec![0, 2, 4]);
-    assert_eq!(lru.accessed(10, 20667,), vec![]);
-    assert_eq!(lru.accessed(12, 20667,), vec![]);
-    assert_eq!(lru.accessed(14, 20667,), vec![]);
-    assert_eq!(lru.accessed(16, 20667,), vec![6, 8, 10, 12]);
-    assert_eq!(lru.accessed(18, 20667,), vec![]);
-    assert_eq!(lru.accessed(20, 20667,), vec![]);
-    assert_eq!(lru.accessed(22, 20667,), vec![]);
-    assert_eq!(lru.accessed(24, 20667,), vec![14, 16, 18, 20]);
+    assert_eq!(lru.accessed(0, size,), vec![]);
+    assert_eq!(lru.accessed(2, size,), vec![]);
+    assert_eq!(lru.accessed(4, size,), vec![]);
+    assert_eq!(lru.accessed(6, size,), vec![]);
+    assert_eq!(
+        lru.accessed(8, size,),
+        vec![(0, size), (2, size), (4, size)]
+    );
+    assert_eq!(lru.accessed(10, size,), vec![]);
+    assert_eq!(lru.accessed(12, size,), vec![]);
+    assert_eq!(lru.accessed(14, size,), vec![]);
+    assert_eq!(
+        lru.accessed(16, size,),
+        vec![(6, size), (8, size), (10, size), (12, size)]
+    );
+    assert_eq!(lru.accessed(18, size,), vec![]);
+    assert_eq!(lru.accessed(20, size,), vec![]);
+    assert_eq!(lru.accessed(22, size,), vec![]);
+    assert_eq!(
+        lru.accessed(24, size,),
+        vec![(14, size), (16, size), (18, size), (20, size)]
+    );
 }
 
 #[test]
