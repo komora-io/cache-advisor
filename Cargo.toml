@@ -1,5 +1,5 @@
 [package]
-name = "cache-evictor"
+name = "cache-advisor"
 version = "0.0.1"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "scan resistant concurrent cache eviction manager"

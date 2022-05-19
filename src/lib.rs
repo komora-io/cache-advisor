@@ -337,13 +337,13 @@ impl CacheAccess {
 
 /// A simple eviction manager.
 #[derive(Clone)]
-pub struct CacheEvictor {
+pub struct CacheAdvisor {
     shards: Arc<[(AccessQueue, Mutex<Shard>)]>,
     ebr: Ebr<Box<AccessBlock>>,
 }
 
-impl CacheEvictor {
-    /// Instantiates a new `CacheEvictor` eviction manager.
+impl CacheAdvisor {
+    /// Instantiates a new `CacheAdvisor` eviction manager.
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity >= N_SHARDS,
@@ -353,10 +353,10 @@ impl CacheEvictor {
         let shard_capacity = capacity / N_SHARDS;
 
         let mut shards = Vec::with_capacity(N_SHARDS);
-        for i in 0..N_SHARDS {
+        for _ in 0..N_SHARDS {
             shards.push((
                 AccessQueue::default(),
-                Mutex::new(Shard::new(shard_capacity, i)),
+                Mutex::new(Shard::new(shard_capacity)),
             ))
         }
 
@@ -457,11 +457,10 @@ struct Shard {
     entries: FastSet8<Entry>,
     capacity: usize,
     size: usize,
-    shard_idx: usize,
 }
 
 impl Shard {
-    fn new(capacity: usize, shard_idx: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "shard capacity must be non-zero");
 
         Self {
@@ -469,7 +468,6 @@ impl Shard {
             entries: FastSet8::default(),
             capacity,
             size: 0,
-            shard_idx,
         }
     }
 
@@ -533,7 +531,7 @@ impl Shard {
 
 #[test]
 fn lru_smoke_test() {
-    let mut lru = CacheEvictor::new(2);
+    let mut lru = CacheAdvisor::new(2);
     for i in 0..1000 {
         lru.accessed(i, 16);
     }
@@ -545,7 +543,7 @@ fn lru_access_test() {
     let ci = CacheAccess::new(6, size);
     assert_eq!(ci.size(), 32 * 1024);
 
-    let mut lru = CacheEvictor::new(4096);
+    let mut lru = CacheAdvisor::new(4096);
 
     assert_eq!(lru.accessed(0, size,), vec![]);
     assert_eq!(lru.accessed(2, size,), vec![]);
