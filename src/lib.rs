@@ -16,11 +16,7 @@ mod dll;
 
 use crate::dll::{DoublyLinkedList, Node};
 
-//#[cfg(any(test, feature = "lock_free_delays"))]
-// const MAX_QUEUE_ITEMS: usize = 4;
-
-// #[cfg(not(any(test, feature = "lock_free_delays")))]
-const MAX_QUEUE_ITEMS: usize = 16;
+const MAX_QUEUE_ITEMS: usize = 8;
 
 const N_SHARDS: usize = 256;
 
@@ -195,7 +191,7 @@ impl CacheAccess {
     }
 }
 
-/// A simple eviction manager.
+/// A simple eviction manager with 256 shards.
 #[derive(Clone)]
 pub struct CacheAdvisor {
     shards: Arc<[TryMutex<Shard>]>,
@@ -233,8 +229,8 @@ impl CacheAdvisor {
     }
 
     /// Called when an item is accessed. Returns a Vec of items to be
-    /// evicted. Uses flat-combining to avoid blocking on what can
-    /// be an asynchronous operation.
+    /// evicted. Avoids blocking under contention by using flat-combining
+    /// on 256 LRU shards.
     pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<(u64, usize)> {
         self.local_queue.push((id, cost));
 
@@ -244,10 +240,7 @@ impl CacheAdvisor {
             return ret;
         }
 
-        let local_queue =
-            std::mem::replace(&mut self.local_queue, Vec::with_capacity(MAX_QUEUE_ITEMS));
-
-        for (id, cost) in local_queue {
+        while let Some((id, cost)) = self.local_queue.pop() {
             let shard_idx = (id.to_le_bytes()[0] as u64 % N_SHARDS as u64) as usize;
             let shard_mu = &self.shards[shard_idx];
             let access_queue = &self.access_queues[shard_idx];
@@ -255,8 +248,6 @@ impl CacheAdvisor {
 
             // use flat-combining to avoid lock contention
             if let Some(mut shard) = shard_mu.try_lock() {
-                shard.accessed(cache_access, shard_idx, &mut ret);
-
                 // we take len here and bound pops to this number
                 // because we don't want to keep going forever
                 // if new items are flowing in - we need to get
@@ -266,6 +257,8 @@ impl CacheAdvisor {
                         shard.accessed(queued_cache_access, shard_idx, &mut ret);
                     }
                 }
+
+                shard.accessed(cache_access, shard_idx, &mut ret);
             } else {
                 access_queue.push(cache_access);
             }
@@ -345,7 +338,6 @@ impl Shard {
         }
     }
 
-    /// `PageId`s in the shard list are indexes of the entries.
     fn accessed(
         &mut self,
         cache_access: CacheAccess,
@@ -357,8 +349,8 @@ impl Shard {
             self.size -= old_size;
 
             // This is a bit hacky but it's done
-            // this way because we don't have a way
-            // of mutating a key that is in a HashSet.
+            // this way because HashSet doesn't have
+            // a get_mut method.
             //
             // This is safe to do because the hash
             // happens based on the PageId of the
@@ -375,8 +367,6 @@ impl Shard {
         let new_size = cache_access.size();
         self.size += new_size;
 
-        //dbg!(new_size, self.size, self.capacity);
-
         while self.size > self.capacity {
             if self.dll.len() == 1 {
                 // don't evict what we just added
@@ -388,11 +378,11 @@ impl Shard {
             let node_size = node.size();
             let eviction_cache_access: CacheAccess = unsafe { *node.inner.get() };
 
-            assert!(self.entries.remove(&pid_bytes));
-
             let item = eviction_cache_access.pid(u8::try_from(shard_idx).unwrap());
             let size = eviction_cache_access.size();
             ret.push((item, size));
+
+            assert!(self.entries.remove(&pid_bytes));
 
             self.size -= node_size;
 
