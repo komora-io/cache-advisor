@@ -15,8 +15,13 @@ edition = "2021"
 [features]
 lock_free_delays = []
 
+[profile.bench]
+debug = true
+opt-level = 3
+
 [profile.release]
 debug = true
 opt-level = 3
+
 [dependencies]
-ebr = "0.0.5"
+crossbeam-queue = "0.3.5"

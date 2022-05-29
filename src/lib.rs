@@ -1,71 +1,61 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     hash::{Hash, Hasher},
-    mem::MaybeUninit,
+    num::Wrapping,
     ptr::addr_of,
-    sync::{
-        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 
-use ebr::{Ebr, Guard};
+use crossbeam_queue::SegQueue;
 
 mod dll;
 
 use crate::dll::{DoublyLinkedList, Node};
 
-#[cfg(any(test, feature = "lock_free_delays"))]
-fn debug_delay() {
-    std::thread::yield_now();
-}
+#[derive(Clone)]
+struct Rng(Wrapping<u32>);
 
-#[cfg(not(any(test, feature = "lock_free_delays")))]
-fn debug_delay() {}
+impl Rng {
+    #[inline]
+    fn bool_with_probability(&mut self, pct: u8) -> bool {
+        assert!(pct <= 100);
 
-fn random_bool() -> bool {
-    use std::cell::Cell;
-    use std::num::Wrapping;
-
-    thread_local! {
-        static RNG: Cell<Wrapping<u32>> = Cell::new(Wrapping(1406868647));
-    }
-
-    RNG.with(|rng| {
-        let mut x = rng.get();
+        let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
-        rng.set(x);
-        ((x.0 as u64).wrapping_mul(2 as u64) >> 32) as u32
-    }) == 1
-}
 
-fn probabilistic_size(input: usize) -> u8 {
-    let po2 = if random_bool() {
-        input.next_power_of_two() >> 1
-    } else {
-        input.next_power_of_two()
-    };
+        self.0 = x;
 
-    let ret = if po2 == 0 {
-        0
-    } else {
-        po2.trailing_zeros() as u8
-    };
+        let rand = ((x.0 as u64).wrapping_mul(100) >> 32) as u32;
 
-    assert!(
-        ret < 64,
-        "input {} should not return a number over 64, {}",
-        input,
-        ret
-    );
+        rand < pct as u32
+    }
 
-    ret
+    /// Returns a compressed size which
+    /// has been probabilistically chosen.
+    fn probabilistic_size(&mut self, input: usize) -> u8 {
+        // TODO shift po2 by expected value proportional
+        // to error
+        let po2 = (input + 1).next_power_of_two();
+        let err = po2 - (input + 1);
+        let probability_to_downshift = (err * 200) / po2;
+
+        assert!(probability_to_downshift < 100);
+
+        let maybe_downshifted = if self.bool_with_probability(probability_to_downshift as u8) {
+            assert_ne!(probability_to_downshift, 0);
+            po2 >> 1
+        } else {
+            po2
+        };
+
+        maybe_downshifted.trailing_zeros() as u8
+    }
 }
 
 fn probabilistic_unsize(input: u8) -> usize {
-    1 << input
+    (1 << input) - 1
 }
 
 pub struct Fnv(u64);
@@ -96,204 +86,21 @@ impl std::hash::Hasher for Fnv {
     }
 }
 
-pub(crate) type FastSet8<V> = std::collections::HashSet<V, std::hash::BuildHasherDefault<Fnv>>;
+pub(crate) type FnvSet8<V> = std::collections::HashSet<V, std::hash::BuildHasherDefault<Fnv>>;
 
 type PageId = u64;
 
-#[cfg(any(test, feature = "lock_free_delays"))]
-const MAX_QUEUE_ITEMS: usize = 4;
+//#[cfg(any(test, feature = "lock_free_delays"))]
+// const MAX_QUEUE_ITEMS: usize = 4;
 
-#[cfg(not(any(test, feature = "lock_free_delays")))]
-const MAX_QUEUE_ITEMS: usize = 64;
+//#[cfg(any(test, feature = "lock_free_delays"))]
+// const N_SHARDS: usize = 2;
 
-#[cfg(any(test, feature = "lock_free_delays"))]
-const N_SHARDS: usize = 2;
+// #[cfg(not(any(test, feature = "lock_free_delays")))]
+const MAX_QUEUE_ITEMS: usize = 16;
 
-#[cfg(not(any(test, feature = "lock_free_delays")))]
+//#[cfg(not(any(test, feature = "lock_free_delays")))]
 const N_SHARDS: usize = 256;
-
-const SHARD_BITS: usize = N_SHARDS.trailing_zeros() as usize;
-
-struct AccessBlock {
-    len: AtomicUsize,
-    block: [AtomicU64; MAX_QUEUE_ITEMS],
-    next: AtomicPtr<AccessBlock>,
-}
-
-impl Default for AccessBlock {
-    fn default() -> AccessBlock {
-        AccessBlock {
-            len: AtomicUsize::new(0),
-            block: unsafe { MaybeUninit::zeroed().assume_init() },
-            next: AtomicPtr::default(),
-        }
-    }
-}
-
-struct AccessQueue {
-    writing: AtomicPtr<AccessBlock>,
-    full_list: AtomicPtr<AccessBlock>,
-}
-
-impl AccessBlock {
-    fn new(item: CacheAccess) -> AccessBlock {
-        let mut ret = AccessBlock {
-            len: AtomicUsize::new(1),
-            block: unsafe { MaybeUninit::zeroed().assume_init() },
-            next: AtomicPtr::default(),
-        };
-        ret.block[0] = AtomicU64::from(u64::from(item));
-        ret
-    }
-}
-
-impl Default for AccessQueue {
-    fn default() -> AccessQueue {
-        AccessQueue {
-            writing: AtomicPtr::new(Box::into_raw(Box::default())),
-            full_list: AtomicPtr::default(),
-        }
-    }
-}
-
-impl AccessQueue {
-    fn push(&self, item: CacheAccess) -> bool {
-        loop {
-            debug_delay();
-            let head = self.writing.load(Ordering::Acquire);
-            let block = unsafe { &*head };
-
-            debug_delay();
-            let offset = block.len.fetch_add(1, Ordering::Acquire);
-
-            if offset < MAX_QUEUE_ITEMS {
-                let item_u64: u64 = item.into();
-                assert_ne!(item_u64, 0);
-                debug_delay();
-                unsafe {
-                    block
-                        .block
-                        .get_unchecked(offset)
-                        .store(item_u64, Ordering::Release);
-                }
-                return false;
-            } else {
-                // install new writer
-                let new = Box::into_raw(Box::new(AccessBlock::new(item)));
-                debug_delay();
-                let res = self.writing.compare_exchange_weak(
-                    head,
-                    new,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                );
-                if res.is_err() {
-                    // we lost the CAS, free the new item that was
-                    // never published to other threads
-                    unsafe {
-                        drop(Box::from_raw(new));
-                    }
-                    continue;
-                }
-
-                // push the now-full item to the full list for future
-                // consumption
-                let mut ret;
-                let mut full_list_ptr = self.full_list.load(Ordering::Acquire);
-                while {
-                    // we loop because maybe other threads are pushing stuff too
-                    block.next.store(full_list_ptr, Ordering::Release);
-                    debug_delay();
-                    ret = self.full_list.compare_exchange_weak(
-                        full_list_ptr,
-                        head,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    );
-                    ret.is_err()
-                } {
-                    full_list_ptr = ret.unwrap_err();
-                }
-                return true;
-            }
-        }
-    }
-
-    fn take<'a>(&self, guard: Guard<'a, Box<AccessBlock>>) -> CacheAccessIter<'a> {
-        debug_delay();
-        let ptr = self.full_list.swap(std::ptr::null_mut(), Ordering::AcqRel);
-
-        CacheAccessIter {
-            guard,
-            current_offset: 0,
-            current_block: ptr,
-        }
-    }
-}
-
-impl Drop for AccessQueue {
-    fn drop(&mut self) {
-        debug_delay();
-        let writing = self.writing.load(Ordering::Acquire);
-        unsafe {
-            Box::from_raw(writing);
-        }
-        debug_delay();
-        let mut head = self.full_list.load(Ordering::Acquire);
-        while !head.is_null() {
-            unsafe {
-                debug_delay();
-                let next = (*head).next.swap(std::ptr::null_mut(), Ordering::Release);
-                Box::from_raw(head);
-                head = next;
-            }
-        }
-    }
-}
-
-struct CacheAccessIter<'a> {
-    guard: Guard<'a, Box<AccessBlock>>,
-    current_offset: usize,
-    current_block: *mut AccessBlock,
-}
-
-impl<'a> Iterator for CacheAccessIter<'a> {
-    type Item = CacheAccess;
-
-    fn next(&mut self) -> Option<CacheAccess> {
-        while !self.current_block.is_null() {
-            let current_block = unsafe { &*self.current_block };
-
-            debug_delay();
-            if self.current_offset >= MAX_QUEUE_ITEMS {
-                let to_drop_ptr = self.current_block;
-                debug_delay();
-                self.current_block = current_block.next.load(Ordering::Acquire);
-                self.current_offset = 0;
-                debug_delay();
-                let to_drop = unsafe { Box::from_raw(to_drop_ptr) };
-                self.guard.defer_drop(to_drop);
-                continue;
-            }
-
-            let mut next = 0;
-
-            while next == 0 {
-                // we spin here because there's a race between bumping
-                // the offset and setting the value to something other
-                // than 0 (and 0 is an invalid value)
-                debug_delay();
-                next = current_block.block[self.current_offset].load(Ordering::Acquire);
-            }
-
-            self.current_offset += 1;
-
-            return Some(CacheAccess::from(next));
-        }
-
-        None
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheAccess(u64);
@@ -328,8 +135,8 @@ impl CacheAccess {
         ((shard as u64) << 56) | (self.0 & PARTIAL_PID_MASK)
     }
 
-    fn new(pid: PageId, sz: usize) -> CacheAccess {
-        let size_byte: u64 = (probabilistic_size(sz) as u64) << 56;
+    fn new(pid: PageId, sz: usize, rng: &mut Rng) -> CacheAccess {
+        let size_byte: u64 = (rng.probabilistic_size(sz) as u64) << 56;
 
         CacheAccess(size_byte | (pid & PARTIAL_PID_MASK))
     }
@@ -338,8 +145,10 @@ impl CacheAccess {
 /// A simple eviction manager.
 #[derive(Clone)]
 pub struct CacheAdvisor {
-    shards: Arc<[(AccessQueue, Mutex<Shard>)]>,
-    ebr: Ebr<Box<AccessBlock>>,
+    shards: Arc<[Mutex<Shard>]>,
+    access_queues: Arc<[SegQueue<CacheAccess>]>,
+    local_queue: Vec<(u64, usize)>,
+    rng: Rng,
 }
 
 impl CacheAdvisor {
@@ -354,15 +163,19 @@ impl CacheAdvisor {
 
         let mut shards = Vec::with_capacity(N_SHARDS);
         for _ in 0..N_SHARDS {
-            shards.push((
-                AccessQueue::default(),
-                Mutex::new(Shard::new(shard_capacity)),
-            ))
+            shards.push(Mutex::new(Shard::new(shard_capacity)))
+        }
+
+        let mut access_queues = Vec::with_capacity(N_SHARDS);
+        for _ in 0..N_SHARDS {
+            access_queues.push(SegQueue::default());
         }
 
         Self {
             shards: shards.into(),
-            ebr: Ebr::default(),
+            access_queues: access_queues.into(),
+            local_queue: Vec::with_capacity(MAX_QUEUE_ITEMS),
+            rng: Rng(Wrapping(1406868647)),
         }
     }
 
@@ -370,33 +183,41 @@ impl CacheAdvisor {
     /// evicted. Uses flat-combining to avoid blocking on what can
     /// be an asynchronous operation.
     pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<(u64, usize)> {
-        let guard = self.ebr.pin();
-
-        let shards = N_SHARDS as u64;
-        let (shard_idx, shifted_pid) = (id % shards, id >> SHARD_BITS);
-        let idx: usize = shard_idx.try_into().unwrap();
-        let (access_queue, shard_mu): &(AccessQueue, Mutex<Shard>) = &self.shards[idx];
-
-        let cache_access = CacheAccess::new(shifted_pid, cost);
-        let filled = access_queue.push(cache_access);
+        self.local_queue.push((id, cost));
 
         let mut ret = vec![];
-        if filled {
-            // only try to acquire this if the access queue has filled
-            // an entire segment
+
+        if self.local_queue.len() < MAX_QUEUE_ITEMS {
+            return ret;
+        }
+
+        let local_queue =
+            std::mem::replace(&mut self.local_queue, Vec::with_capacity(MAX_QUEUE_ITEMS));
+
+        for (id, cost) in local_queue {
+            let shard_idx = (id % N_SHARDS as u64) as usize;
+            let shard_mu = &self.shards[shard_idx];
+            let access_queue = &self.access_queues[shard_idx];
+            let cache_access = CacheAccess::new(id, cost, &mut self.rng);
+
+            // use flat-combining to avoid lock contention
             if let Ok(mut shard) = shard_mu.try_lock() {
-                let accesses = access_queue.take(guard);
-                for item in accesses {
-                    let to_evict = shard.accessed(item);
-                    // map shard internal offsets to global items ids
-                    for cache_access in to_evict {
-                        let item = cache_access.pid(u8::try_from(shard_idx).unwrap());
-                        let size = cache_access.size();
-                        ret.push((item, size));
+                shard.accessed(cache_access, shard_idx, &mut ret);
+
+                // we take len here and bound pops to this number
+                // because we don't want to keep going forever
+                // if new items are flowing in - we need to get
+                // back to our own work eventually.
+                for _ in 0..access_queue.len() {
+                    if let Some(queued_cache_access) = access_queue.pop() {
+                        shard.accessed(queued_cache_access, shard_idx, &mut ret);
                     }
                 }
+            } else {
+                access_queue.push(cache_access);
             }
         }
+
         ret
     }
 }
@@ -454,7 +275,7 @@ impl Hash for Entry {
 
 struct Shard {
     dll: DoublyLinkedList,
-    entries: FastSet8<Entry>,
+    entries: FnvSet8<Entry>,
     capacity: usize,
     size: usize,
 }
@@ -465,14 +286,19 @@ impl Shard {
 
         Self {
             dll: DoublyLinkedList::default(),
-            entries: FastSet8::default(),
+            entries: FnvSet8::default(),
             capacity,
             size: 0,
         }
     }
 
     /// `PageId`s in the shard list are indexes of the entries.
-    fn accessed(&mut self, cache_access: CacheAccess) -> Vec<CacheAccess> {
+    fn accessed(
+        &mut self,
+        cache_access: CacheAccess,
+        shard_idx: usize,
+        ret: &mut Vec<(u64, usize)>,
+    ) {
         let new_size = cache_access.size();
 
         if let Some(entry) = self.entries.get(cache_access.pid_bytes()) {
@@ -497,8 +323,6 @@ impl Shard {
 
         self.size += new_size;
 
-        let mut to_evict = vec![];
-
         while self.size > self.capacity {
             if self.dll.len() == 1 {
                 // don't evict what we just added
@@ -508,11 +332,13 @@ impl Shard {
             let node: Box<Node> = self.dll.pop_tail().unwrap();
             let pid_bytes = node.pid_bytes();
             let node_size = node.size();
-            let cache_access: CacheAccess = unsafe { *node.inner.get() };
+            let eviction_cache_access: CacheAccess = unsafe { *node.inner.get() };
 
             assert!(self.entries.remove(pid_bytes));
 
-            to_evict.push(cache_access);
+            let item = eviction_cache_access.pid(u8::try_from(shard_idx).unwrap());
+            let size = eviction_cache_access.size();
+            ret.push((item, size));
 
             self.size -= node_size;
 
@@ -524,8 +350,6 @@ impl Shard {
             // the DLL and our entries map.
             drop(node);
         }
-
-        to_evict
     }
 }
 
@@ -538,58 +362,18 @@ fn lru_smoke_test() {
 }
 
 #[test]
-fn lru_access_test() {
-    let size = 20667;
-    let ci = CacheAccess::new(6, size);
-    assert_eq!(ci.size(), 32 * 1024);
-
-    let mut lru = CacheAdvisor::new(4096);
-
-    assert_eq!(lru.accessed(0, size,), vec![]);
-    assert_eq!(lru.accessed(2, size,), vec![]);
-    assert_eq!(lru.accessed(4, size,), vec![]);
-    assert_eq!(lru.accessed(6, size,), vec![]);
-    assert_eq!(
-        lru.accessed(8, size,),
-        vec![(0, size), (2, size), (4, size)]
-    );
-    assert_eq!(lru.accessed(10, size,), vec![]);
-    assert_eq!(lru.accessed(12, size,), vec![]);
-    assert_eq!(lru.accessed(14, size,), vec![]);
-    assert_eq!(
-        lru.accessed(16, size,),
-        vec![(6, size), (8, size), (10, size), (12, size)]
-    );
-    assert_eq!(lru.accessed(18, size,), vec![]);
-    assert_eq!(lru.accessed(20, size,), vec![]);
-    assert_eq!(lru.accessed(22, size,), vec![]);
-    assert_eq!(
-        lru.accessed(24, size,),
-        vec![(14, size), (16, size), (18, size), (20, size)]
-    );
-}
-
-#[test]
-fn print() {
-    let n = 1000;
-    let mut trues = 0;
-    for _ in 0..n {
-        if random_bool() {
-            trues += 1;
-        }
+fn probabilistic_ev() {
+    let mut rng = Rng(Wrapping(1406868647));
+    let mut resized = 0;
+    let mut actual = 0;
+    for i in 0..1000 {
+        let compressed = rng.probabilistic_size(i);
+        let decompressed = probabilistic_unsize(compressed);
+        resized += decompressed;
+        actual += i;
     }
 
-    assert!(trues > 490 && trues < 510);
+    let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
 
-    let mut compressed_sizes = vec![];
-    let mut true_sum = 0;
-    for i in 0..n {
-        compressed_sizes.push(probabilistic_size(i));
-        true_sum += i;
-    }
-    let sum: usize = compressed_sizes.into_iter().map(probabilistic_unsize).sum();
-
-    let abs_delta = ((sum as f64 / true_sum as f64) - 1.).abs();
-
-    assert!(abs_delta < 0.05, "delta is actually {}", abs_delta);
+    assert!(abs_delta < 0.0001, "delta is actually {}", abs_delta);
 }
