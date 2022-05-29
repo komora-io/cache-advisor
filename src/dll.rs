@@ -120,31 +120,6 @@ impl DoublyLinkedList {
         self.head = ptr;
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_tail(&mut self, item: CacheAccess) {
-        self.len += 1;
-
-        let node = Node {
-            inner: UnsafeCell::new(item),
-            next: self.tail,
-            prev: ptr::null_mut(),
-        };
-
-        let ptr = Box::into_raw(Box::new(node));
-
-        if !self.tail.is_null() {
-            unsafe {
-                (*self.tail).prev = ptr;
-            }
-        }
-
-        if self.head.is_null() {
-            self.head = ptr;
-        }
-
-        self.tail = ptr;
-    }
-
     pub(crate) fn promote(&mut self, ptr: *mut Node) {
         if self.head == ptr {
             return;
@@ -162,29 +137,6 @@ impl DoublyLinkedList {
             (*ptr).unwire();
 
             self.push_head_ptr(ptr);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pop_head(&mut self) -> Option<CacheAccess> {
-        if self.head.is_null() {
-            return None;
-        }
-
-        self.len -= 1;
-
-        unsafe {
-            let mut head = Box::from_raw(self.head);
-
-            if self.head == self.tail {
-                self.tail = ptr::null_mut();
-            }
-
-            self.head = head.prev;
-
-            head.unwire();
-
-            Some(**head)
         }
     }
 
@@ -213,43 +165,4 @@ impl DoublyLinkedList {
             Some(tail)
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn into_vec(mut self) -> Vec<CacheAccess> {
-        let mut res = vec![];
-        while let Some(val) = self.pop_head() {
-            res.push(val);
-        }
-        res
-    }
-}
-
-#[allow(unused_results)]
-#[test]
-fn basic_functionality() {
-    let mut dll = DoublyLinkedList::default();
-    dll.push_head(5.into());
-    dll.push_tail(6.into());
-    dll.push_head(4.into());
-    dll.push_tail(7.into());
-    dll.push_tail(8.into());
-    dll.push_head(3.into());
-    dll.push_tail(9.into());
-    dll.push_head(2.into());
-    dll.push_head(1.into());
-    assert_eq!(dll.len(), 9);
-    assert_eq!(
-        dll.into_vec(),
-        vec![
-            1.into(),
-            2.into(),
-            3.into(),
-            4.into(),
-            5.into(),
-            6.into(),
-            7.into(),
-            8.into(),
-            9.into()
-        ]
-    );
 }

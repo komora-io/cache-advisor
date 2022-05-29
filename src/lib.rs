@@ -1,9 +1,13 @@
 use std::{
     borrow::{Borrow, BorrowMut},
+    cell::UnsafeCell,
     hash::{Hash, Hasher},
     num::Wrapping,
-    ptr::addr_of,
-    sync::{Arc, Mutex},
+    ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use crossbeam_queue::SegQueue;
@@ -11,6 +15,69 @@ use crossbeam_queue::SegQueue;
 mod dll;
 
 use crate::dll::{DoublyLinkedList, Node};
+
+//#[cfg(any(test, feature = "lock_free_delays"))]
+// const MAX_QUEUE_ITEMS: usize = 4;
+
+// #[cfg(not(any(test, feature = "lock_free_delays")))]
+const MAX_QUEUE_ITEMS: usize = 16;
+
+const N_SHARDS: usize = 256;
+
+// very very simple mutex that reduces instruction cache pollution
+struct TryMutex<T> {
+    inner: UnsafeCell<T>,
+    mu: AtomicBool,
+}
+
+impl<T> TryMutex<T> {
+    fn new(inner: T) -> TryMutex<T> {
+        TryMutex {
+            inner: inner.into(),
+            mu: false.into(),
+        }
+    }
+
+    #[inline]
+    fn try_lock(&self) -> Option<TryMutexGuard<'_, T>> {
+        if self.mu.swap(true, Ordering::Acquire) {
+            // already locked
+            None
+        } else {
+            Some(TryMutexGuard { tm: self })
+        }
+    }
+}
+
+struct TryMutexGuard<'a, T> {
+    tm: &'a TryMutex<T>,
+}
+
+unsafe impl<T: Send> Send for TryMutex<T> {}
+
+unsafe impl<T: Send> Sync for TryMutex<T> {}
+
+impl<'a, T> Drop for TryMutexGuard<'a, T> {
+    #[inline]
+    fn drop(&mut self) {
+        assert!(self.tm.mu.swap(false, Ordering::Release));
+    }
+}
+
+impl<'a, T> Deref for TryMutexGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.tm.inner.get() }
+    }
+}
+
+impl<'a, T> DerefMut for TryMutexGuard<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.tm.inner.get() }
+    }
+}
 
 #[derive(Clone)]
 struct Rng(Wrapping<u32>);
@@ -35,10 +102,12 @@ impl Rng {
     /// Returns a compressed size which
     /// has been probabilistically chosen.
     fn probabilistic_size(&mut self, input: usize) -> u8 {
-        // TODO shift po2 by expected value proportional
-        // to error
-        let po2 = (input + 1).next_power_of_two();
-        let err = po2 - (input + 1);
+        if input <= 2 {
+            return u8::try_from(input).unwrap();
+        };
+
+        let po2 = input.next_power_of_two();
+        let err = po2 - input;
         let probability_to_downshift = (err * 200) / po2;
 
         assert!(probability_to_downshift < 100);
@@ -54,8 +123,11 @@ impl Rng {
     }
 }
 
-fn probabilistic_unsize(input: u8) -> usize {
-    (1 << input) - 1
+const fn probabilistic_unsize(input: u8) -> usize {
+    match input {
+        0..=2 => input as usize,
+        i => 1 << i,
+    }
 }
 
 pub struct Fnv(u64);
@@ -90,62 +162,43 @@ pub(crate) type FnvSet8<V> = std::collections::HashSet<V, std::hash::BuildHasher
 
 type PageId = u64;
 
-//#[cfg(any(test, feature = "lock_free_delays"))]
-// const MAX_QUEUE_ITEMS: usize = 4;
-
-//#[cfg(any(test, feature = "lock_free_delays"))]
-// const N_SHARDS: usize = 2;
-
-// #[cfg(not(any(test, feature = "lock_free_delays")))]
-const MAX_QUEUE_ITEMS: usize = 16;
-
-//#[cfg(not(any(test, feature = "lock_free_delays")))]
-const N_SHARDS: usize = 256;
+fn _sz_test() {
+    let _: [u8; 8] = [0; std::mem::size_of::<CacheAccess>()];
+    let _: [u8; 1] = [0; std::mem::align_of::<CacheAccess>()];
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CacheAccess(u64);
-
-impl From<CacheAccess> for u64 {
-    fn from(ca: CacheAccess) -> u64 {
-        ca.0
-    }
+pub(crate) struct CacheAccess {
+    size: u8,
+    pid_bytes: [u8; 7],
 }
-
-impl From<u64> for CacheAccess {
-    fn from(u: u64) -> CacheAccess {
-        CacheAccess(u)
-    }
-}
-
-impl CacheAccess {
-    #[inline]
-    fn pid_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(addr_of!(self.0) as _, 7) }
-    }
-}
-
-const PARTIAL_PID_MASK: u64 = 0x00FFFFFF_FFFFFFFF;
 
 impl CacheAccess {
     fn size(&self) -> usize {
-        probabilistic_unsize((self.0 >> 56) as u8)
+        probabilistic_unsize((self.size) as u8)
     }
 
     fn pid(&self, shard: u8) -> PageId {
-        ((shard as u64) << 56) | (self.0 & PARTIAL_PID_MASK)
+        let mut pid_bytes = [0; 8];
+        pid_bytes[1..8].copy_from_slice(&self.pid_bytes);
+        pid_bytes[0] = shard;
+        PageId::from_le_bytes(pid_bytes)
     }
 
     fn new(pid: PageId, sz: usize, rng: &mut Rng) -> CacheAccess {
-        let size_byte: u64 = (rng.probabilistic_size(sz) as u64) << 56;
+        let size = rng.probabilistic_size(sz);
 
-        CacheAccess(size_byte | (pid & PARTIAL_PID_MASK))
+        let mut pid_bytes = [0; 7];
+        pid_bytes.copy_from_slice(&pid.to_le_bytes()[1..8]);
+
+        CacheAccess { size, pid_bytes }
     }
 }
 
 /// A simple eviction manager.
 #[derive(Clone)]
 pub struct CacheAdvisor {
-    shards: Arc<[Mutex<Shard>]>,
+    shards: Arc<[TryMutex<Shard>]>,
     access_queues: Arc<[SegQueue<CacheAccess>]>,
     local_queue: Vec<(u64, usize)>,
     rng: Rng,
@@ -163,7 +216,7 @@ impl CacheAdvisor {
 
         let mut shards = Vec::with_capacity(N_SHARDS);
         for _ in 0..N_SHARDS {
-            shards.push(Mutex::new(Shard::new(shard_capacity)))
+            shards.push(TryMutex::new(Shard::new(shard_capacity)))
         }
 
         let mut access_queues = Vec::with_capacity(N_SHARDS);
@@ -195,13 +248,13 @@ impl CacheAdvisor {
             std::mem::replace(&mut self.local_queue, Vec::with_capacity(MAX_QUEUE_ITEMS));
 
         for (id, cost) in local_queue {
-            let shard_idx = (id % N_SHARDS as u64) as usize;
+            let shard_idx = (id.to_le_bytes()[0] as u64 % N_SHARDS as u64) as usize;
             let shard_mu = &self.shards[shard_idx];
             let access_queue = &self.access_queues[shard_idx];
             let cache_access = CacheAccess::new(id, cost, &mut self.rng);
 
             // use flat-combining to avoid lock contention
-            if let Ok(mut shard) = shard_mu.try_lock() {
+            if let Some(mut shard) = shard_mu.try_lock() {
                 shard.accessed(cache_access, shard_idx, &mut ret);
 
                 // we take len here and bound pops to this number
@@ -229,8 +282,8 @@ unsafe impl Send for Entry {}
 
 impl Ord for Entry {
     fn cmp(&self, other: &Entry) -> std::cmp::Ordering {
-        let left_pid: &[u8] = self.borrow();
-        let right_pid: &[u8] = other.borrow();
+        let left_pid: &[u8; 7] = self.borrow();
+        let right_pid: &[u8; 7] = other.borrow();
         left_pid.cmp(&right_pid)
     }
 }
@@ -243,7 +296,7 @@ impl PartialOrd<Entry> for Entry {
 
 impl PartialEq for Entry {
     fn eq(&self, other: &Entry) -> bool {
-        unsafe { (*self.0).pid_bytes() == (*other.0).pid_bytes() }
+        unsafe { (*self.0).pid_bytes == (*other.0).pid_bytes }
     }
 }
 
@@ -259,9 +312,9 @@ impl Borrow<CacheAccess> for Entry {
     }
 }
 
-impl Borrow<[u8]> for Entry {
-    fn borrow(&self) -> &[u8] {
-        unsafe { &(*self.0).pid_bytes() }
+impl Borrow<[u8; 7]> for Entry {
+    fn borrow(&self) -> &[u8; 7] {
+        unsafe { &(*self.0).pid_bytes }
     }
 }
 
@@ -269,7 +322,7 @@ impl Borrow<[u8]> for Entry {
 // sz sometimes and we access the item by pid
 impl Hash for Entry {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        unsafe { (*self.0).pid_bytes().hash(hasher) }
+        unsafe { (*self.0).pid_bytes.hash(hasher) }
     }
 }
 
@@ -299,10 +352,9 @@ impl Shard {
         shard_idx: usize,
         ret: &mut Vec<(u64, usize)>,
     ) {
-        let new_size = cache_access.size();
-
-        if let Some(entry) = self.entries.get(cache_access.pid_bytes()) {
+        if let Some(entry) = self.entries.get(&cache_access.pid_bytes) {
             let old_size = unsafe { (*entry.0).size() };
+            self.size -= old_size;
 
             // This is a bit hacky but it's done
             // this way because we don't have a way
@@ -312,16 +364,18 @@ impl Shard {
             // happens based on the PageId of the
             // CacheAccess, rather than the size
             // that we modify here.
-            unsafe { *(*entry.0).inner.get_mut() = cache_access };
+            unsafe { (*entry.0).inner.get_mut().size = cache_access.size };
 
-            self.size -= old_size;
             self.dll.promote(entry.0);
         } else {
             let ptr = self.dll.push_head(cache_access);
             self.entries.insert(Entry(ptr));
         };
 
+        let new_size = cache_access.size();
         self.size += new_size;
+
+        //dbg!(new_size, self.size, self.capacity);
 
         while self.size > self.capacity {
             if self.dll.len() == 1 {
@@ -330,11 +384,11 @@ impl Shard {
             }
 
             let node: Box<Node> = self.dll.pop_tail().unwrap();
-            let pid_bytes = node.pid_bytes();
+            let pid_bytes = node.pid_bytes;
             let node_size = node.size();
             let eviction_cache_access: CacheAccess = unsafe { *node.inner.get() };
 
-            assert!(self.entries.remove(pid_bytes));
+            assert!(self.entries.remove(&pid_bytes));
 
             let item = eviction_cache_access.pid(u8::try_from(shard_idx).unwrap());
             let size = eviction_cache_access.size();
@@ -355,7 +409,7 @@ impl Shard {
 
 #[test]
 fn lru_smoke_test() {
-    let mut lru = CacheAdvisor::new(2);
+    let mut lru = CacheAdvisor::new(256);
     for i in 0..1000 {
         lru.accessed(i, 16);
     }
@@ -375,5 +429,5 @@ fn probabilistic_ev() {
 
     let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
 
-    assert!(abs_delta < 0.0001, "delta is actually {}", abs_delta);
+    assert!(abs_delta < 0.005, "delta is actually {}", abs_delta);
 }
