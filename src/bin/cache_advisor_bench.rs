@@ -28,9 +28,6 @@ fn main() {
                 let evicted = cache_advisor.accessed_reuse_buffer(id as u64, SZ);
                 let cost = evicted.iter().map(|(_id, cost)| cost).sum();
                 EVICTED_BYTES.fetch_add(cost, atomic::Ordering::Relaxed);
-                let evicted = cache_advisor.accessed_reuse_buffer(id as u64, SZ);
-                let cost = evicted.iter().map(|(_id, cost)| cost).sum();
-                EVICTED_BYTES.fetch_add(cost, atomic::Ordering::Relaxed);
             }
         });
         threads.push(thread);
