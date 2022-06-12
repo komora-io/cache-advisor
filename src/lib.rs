@@ -259,6 +259,11 @@ pub struct CacheAdvisor {
     resizer: Resizer,
 }
 
+const fn _send_sync_ca() {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<CacheAdvisor>();
+}
+
 impl CacheAdvisor {
     /// Instantiates a new `CacheAdvisor` eviction manager.
     ///
