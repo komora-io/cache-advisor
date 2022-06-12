@@ -1,5 +1,7 @@
 # cache-advisor
 
+[docs](https://docs.rs/cache-advisor)
+
 Tells you when to evict items from a cache. Should be able to sustain
 dozens of millions of accesses per second on modern server hardware
 without any blocking.
