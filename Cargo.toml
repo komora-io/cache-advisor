@@ -1,19 +1,16 @@
 [package]
 name = "cache-advisor"
-version = "0.0.1"
+version = "1.0.8"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
-description = "scan resistant concurrent cache eviction manager"
+description = "scan-resistant concurrent cache eviction manager"
 license = "GPL-3.0"
-homepage = "https://github.com/komora-io/berghain"
-repository = "https://github.com/komora-io/berghain"
+homepage = "https://github.com/komora-io/cache-advisor"
+repository = "https://github.com/komora-io/cache-advisor"
 keywords = ["cache", "lfu", "concurrent", "caching", "lock-free"]
 categories = ["caching", "database-implementations", "concurrency", "data-structures", "algorithms"]
-documentation = "https://docs.rs/berghain/"
+documentation = "https://docs.rs/cache-advisor/"
 readme = "README.md"
 edition = "2021"
-
-[features]
-lock_free_delays = []
 
 [profile.bench]
 debug = true

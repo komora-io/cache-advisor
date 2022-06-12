@@ -16,7 +16,7 @@ mod dll;
 
 use crate::dll::{DoublyLinkedList, Node};
 
-const MAX_QUEUE_ITEMS: usize = 8;
+const MAX_QUEUE_ITEMS: usize = 32;
 // ensures that usize::MAX compresses to less than 128,
 // since the max bit of a u8 size is used to represent
 // the cache tier tag.
@@ -200,7 +200,57 @@ impl CacheAccess {
     }
 }
 
-/// A simple eviction manager with 256 shards.
+/// A simple eviction manager with 256 shards
+/// and two segments to provide for scan resistance.
+/// Tells you when to evict items from a cache.
+///
+/// features:
+///
+/// * two-segment LRU, protects against cache pollution from single-hit items
+/// * 256 shards accessed via non-blocking flatcombining
+/// * local access buffer that must fill up before accessing shared state
+/// * compresses the costs associated with each item to a `u8` using a compression
+///   technique that will converge to the overall true sum of costs over time, but
+///   allows for much less memory to be used for accounting.
+///
+/// # Examples
+/// ```
+/// use cache_advisor::CacheAdvisor;
+///
+/// // each shard stores 10 bytes, 10% of that is in the entry cache
+/// let mut ca = CacheAdvisor::new(256 * 10, 10);
+///
+/// // add item 0 into entry cache
+/// let should_evict = ca.accessed(0, 1);
+/// assert!(should_evict.is_empty());
+///
+/// // promote item 0 into main cache
+/// let should_evict = ca.accessed(0, 1);
+/// assert!(should_evict.is_empty());
+///
+/// // hit other items only once, like a big scan
+/// for i in 1..5000 {
+///     let id = i * 256;
+///     let evicted = ca.accessed(id, 1);
+///
+///     // assert that 0 is never evicted while scanning
+///     assert!(!evicted.contains(&(0, 1)));
+/// }
+///
+/// let mut zero_evicted = false;
+///
+/// // hit other items more than once, assert that zero does get
+/// // evicted eventually.
+/// for i in 1..5000 {
+///     let id = i * 256;
+///     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+///     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+///     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+/// }
+///
+/// assert!(zero_evicted);
+///
+/// ```
 #[derive(Clone)]
 pub struct CacheAdvisor {
     shards: Arc<[TryMutex<Shard>]>,
@@ -425,25 +475,24 @@ impl Shard {
 
             self.entry_size -= node_size;
 
-            if popped_entry.was_promoted() {
-                println!("src/lib.rs:429");
-                self.main_cache.install(node);
-                self.main_size += node_size;
-            } else {
-                let pid_bytes = popped_entry.pid_bytes;
-                assert!(self.entries.remove(&pid_bytes));
+            assert!(
+                !popped_entry.was_promoted(),
+                "somehow, promoted item was still in entry cache"
+            );
 
-                ret.push((item, node_size));
-                let node_box: Box<Node> = unsafe { Box::from_raw(node) };
+            let pid_bytes = popped_entry.pid_bytes;
+            assert!(self.entries.remove(&pid_bytes));
 
-                // NB: node is stored in our entries map
-                // via a raw pointer, which points to
-                // the same allocation used in the DLL.
-                // We have to be careful to free node
-                // only after removing it from both
-                // the DLL and our entries map.
-                drop(node_box);
-            }
+            ret.push((item, node_size));
+            let node_box: Box<Node> = unsafe { Box::from_raw(node) };
+
+            // NB: node is stored in our entries map
+            // via a raw pointer, which points to
+            // the same allocation used in the DLL.
+            // We have to be careful to free node
+            // only after removing it from both
+            // the DLL and our entries map.
+            drop(node_box);
         }
 
         while self.main_size > self.main_capacity && self.main_cache.len() > 1 {
@@ -555,8 +604,6 @@ fn probabilistic_n() {
     let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
 
     assert!(abs_delta < 0.005, "delta is actually {}", abs_delta);
-
-    dbg!(resizer.compress(usize::MAX));
 }
 
 #[test]
