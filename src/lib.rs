@@ -476,6 +476,7 @@ struct Shard {
     entry_size: usize,
     main_capacity: usize,
     main_size: usize,
+    ever_evicted_main: bool,
 }
 
 impl Shard {
@@ -497,6 +498,7 @@ impl Shard {
             main_capacity,
             entry_size: 0,
             main_size: 0,
+            ever_evicted_main: false,
         }
     }
 
@@ -543,6 +545,17 @@ impl Shard {
             }
 
             self.main_size += new_size;
+        } else if !self.ever_evicted_main {
+            // We can put new writes into the
+            // main cache directly until it fills
+            // up, letting us get higher hit rates,
+            // assuming the entry cache is smaller
+            // than the main cache.
+            let mut cache_access = cache_access;
+            cache_access.size |= 128;
+            let ptr = self.main_cache.push_head(cache_access);
+            self.entries.insert(Entry(ptr));
+            self.main_size += new_size;
         } else {
             let ptr = self.entry_cache.push_head(cache_access);
             self.entries.insert(Entry(ptr));
@@ -579,6 +592,8 @@ impl Shard {
         }
 
         while self.main_size > self.main_capacity && self.main_cache.len() > 1 {
+            self.ever_evicted_main = true;
+
             let node: *mut Node = self.main_cache.pop_tail().unwrap();
 
             let popped_main: CacheAccess = unsafe { *(*node).inner.get() };

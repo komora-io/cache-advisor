@@ -1,6 +1,6 @@
 [package]
 name = "cache-advisor"
-version = "1.0.10"
+version = "1.0.11"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "scan-resistant concurrent cache eviction manager"
 license = "GPL-3.0"
