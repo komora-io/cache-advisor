@@ -13,7 +13,7 @@ fn main() {
         .get();
 
     let ops_per_thread: usize = OPS / n_threads;
-    let cache_advisor = CacheAdvisor::new(CAP);
+    let cache_advisor = CacheAdvisor::new(CAP, 80);
 
     let mut threads = vec![];
 
@@ -42,10 +42,10 @@ fn main() {
     let present = added.saturating_sub(evicted);
 
     println!(
-        "added: {}mb, evicted: {}mb, present: {}mb ({} % above cap). {:.2} million accesses/s",
+        "added: {}mb, evicted: {}mb, present: {}kb ({} % above cap). {:.2} million accesses/s",
         added / 1_000_000,
         evicted / 1_000_000,
-        present / 1_000_000,
+        present / 1_000,
         (100 * present.saturating_sub(CAP)) / CAP,
         (OPS * 1000) as f64 / before.elapsed().as_millis() as f64 / 1_000_000.,
     );

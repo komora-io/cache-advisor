@@ -17,7 +17,10 @@ mod dll;
 use crate::dll::{DoublyLinkedList, Node};
 
 const MAX_QUEUE_ITEMS: usize = 8;
-const RESIZE_CUTOFF: usize = 8;
+// ensures that usize::MAX compresses to less than 128,
+// since the max bit of a u8 size is used to represent
+// the cache tier tag.
+const RESIZE_CUTOFF: usize = 63;
 const RESIZE_CUTOFF_U8: u8 = RESIZE_CUTOFF as u8;
 const N_SHARDS: usize = 256;
 
@@ -104,16 +107,22 @@ impl Resizer {
 
         self.decompressed += decompress(ret + RESIZE_CUTOFF_U8) as u128;
 
-        ret + RESIZE_CUTOFF_U8
+        let sz = ret + RESIZE_CUTOFF_U8;
+
+        assert!(sz < 128);
+
+        sz
     }
 }
 
 #[inline]
 const fn decompress(input: u8) -> usize {
-    match input {
-        0..=RESIZE_CUTOFF_U8 => input as usize,
+    // zero-out the access bit
+    let masked = input & 127;
+    match masked {
+        0..=RESIZE_CUTOFF_U8 => masked as usize,
         _ => {
-            if let Some(o) = 1_usize.checked_shl((input - RESIZE_CUTOFF_U8) as u32) {
+            if let Some(o) = 1_usize.checked_shl((masked - RESIZE_CUTOFF_U8) as u32) {
                 o
             } else {
                 usize::MAX
@@ -166,6 +175,10 @@ pub(crate) struct CacheAccess {
 }
 
 impl CacheAccess {
+    fn was_promoted(&self) -> bool {
+        self.size & 128 != 0
+    }
+
     fn size(&self) -> usize {
         decompress((self.size) as u8)
     }
@@ -198,7 +211,26 @@ pub struct CacheAdvisor {
 
 impl CacheAdvisor {
     /// Instantiates a new `CacheAdvisor` eviction manager.
-    pub fn new(capacity: usize) -> Self {
+    ///
+    /// `entry_percent` is how much of the cache should be
+    /// devoted to the "entry" cache. When new items are added
+    /// to the system, they are inserted into the entry cache
+    /// first. If they are accessed at some point while still
+    /// in the entry cache, they will be promoted to the main
+    /// cache. This provides "scan resistance" where the cache
+    /// will avoid being destroyed by things like a scan that
+    /// could otherwise push all of the frequently-accessed
+    /// items out. A value of `20` is a reasonable default,
+    /// which will reserve 20% of the cache capacity for the
+    /// entry cache, and 80% for the main cache. This value
+    /// must be less than or equal to 100. If the main cache
+    /// has never been filled to the point where items are
+    /// evicted, items that are pushed out of the entry cache
+    /// will flow into the main cache, so you don't need to
+    /// worry about under-utilizing available memory. This
+    /// only changes behavior once the cache is full to prevent
+    /// scans from kicking other items out.
+    pub fn new(capacity: usize, entry_percent: u8) -> Self {
         assert!(
             capacity >= N_SHARDS,
             "Please configure the cache \
@@ -208,7 +240,7 @@ impl CacheAdvisor {
 
         let mut shards = Vec::with_capacity(N_SHARDS);
         for _ in 0..N_SHARDS {
-            shards.push(TryMutex::new(Shard::new(shard_capacity)))
+            shards.push(TryMutex::new(Shard::new(shard_capacity, entry_percent)))
         }
 
         let mut access_queues = Vec::with_capacity(N_SHARDS);
@@ -304,21 +336,34 @@ impl Hash for Entry {
 }
 
 struct Shard {
-    dll: DoublyLinkedList,
+    entry_cache: DoublyLinkedList,
+    main_cache: DoublyLinkedList,
     entries: FnvSet8<Entry>,
-    capacity: usize,
-    size: usize,
+    entry_capacity: usize,
+    entry_size: usize,
+    main_capacity: usize,
+    main_size: usize,
 }
 
 impl Shard {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, entry_pct: u8) -> Self {
+        assert!(
+            entry_pct <= 100,
+            "entry cache percent must be less than or equal to 100"
+        );
         assert!(capacity > 0, "shard capacity must be non-zero");
 
+        let entry_capacity = (capacity * entry_pct as usize) / 100;
+        let main_capacity = capacity - entry_capacity;
+
         Self {
-            dll: DoublyLinkedList::default(),
+            entry_cache: DoublyLinkedList::default(),
+            main_cache: DoublyLinkedList::default(),
             entries: FnvSet8::default(),
-            capacity,
-            size: 0,
+            entry_capacity,
+            main_capacity,
+            entry_size: 0,
+            main_size: 0,
         }
     }
 
@@ -328,47 +373,94 @@ impl Shard {
         shard_idx: usize,
         ret: &mut Vec<(u64, usize)>,
     ) {
-        if let Some(entry) = self.entries.get(&cache_access.pid_bytes) {
-            let old_size = unsafe { (*entry.0).size() };
-            self.size -= old_size;
-
-            // This is a bit hacky but it's done
-            // this way because HashSet doesn't have
-            // a get_mut method.
-            //
-            // This is safe to do because the hash
-            // happens based on the PageId of the
-            // CacheAccess, rather than the size
-            // that we modify here.
-            unsafe { (*entry.0).inner.get_mut().size = cache_access.size };
-
-            self.dll.promote(entry.0);
-        } else {
-            let ptr = self.dll.push_head(cache_access);
-            self.entries.insert(Entry(ptr));
-        };
-
         let new_size = cache_access.size();
-        self.size += new_size;
 
-        while self.size > self.capacity {
-            if self.dll.len() == 1 {
-                // don't evict what we just added
-                break;
+        if let Some(entry) = self.entries.get(&cache_access.pid_bytes) {
+            let (old_size, was_promoted) = unsafe {
+                let old_size = (*entry.0).size();
+                let was_promoted = (*entry.0).was_promoted();
+
+                // This is a bit hacky but it's done
+                // this way because HashSet doesn't have
+                // a get_mut method.
+                //
+                // This is safe to do because the hash
+                // happens based on the PageId of the
+                // CacheAccess, rather than the size
+                // that we modify here.
+                (*entry.0).inner.get_mut().size = 128 | cache_access.size;
+
+                (old_size, was_promoted)
+            };
+
+            if was_promoted {
+                // item is already in main cache
+
+                self.main_size -= old_size;
+
+                self.main_cache.unwire(entry.0);
+                self.main_cache.install(entry.0);
+            } else {
+                // item is in entry cache
+
+                self.entry_size -= old_size;
+
+                self.entry_cache.unwire(entry.0);
+                self.main_cache.install(entry.0);
             }
 
-            let node: Box<Node> = self.dll.pop_tail().unwrap();
-            let pid_bytes = node.pid_bytes;
-            let node_size = node.size();
-            let eviction_cache_access: CacheAccess = unsafe { *node.inner.get() };
+            self.main_size += new_size;
+        } else {
+            let ptr = self.entry_cache.push_head(cache_access);
+            self.entries.insert(Entry(ptr));
+            self.entry_size += new_size;
+        };
 
-            let item = eviction_cache_access.pid(u8::try_from(shard_idx).unwrap());
-            let size = eviction_cache_access.size();
-            ret.push((item, size));
+        while self.entry_size > self.entry_capacity && self.entry_cache.len() > 1 {
+            let node: *mut Node = self.entry_cache.pop_tail().unwrap();
 
+            let popped_entry: CacheAccess = unsafe { *(*node).inner.get() };
+            let node_size = popped_entry.size();
+            let item = popped_entry.pid(u8::try_from(shard_idx).unwrap());
+
+            self.entry_size -= node_size;
+
+            if popped_entry.was_promoted() {
+                println!("src/lib.rs:429");
+                self.main_cache.install(node);
+                self.main_size += node_size;
+            } else {
+                let pid_bytes = popped_entry.pid_bytes;
+                assert!(self.entries.remove(&pid_bytes));
+
+                ret.push((item, node_size));
+                let node_box: Box<Node> = unsafe { Box::from_raw(node) };
+
+                // NB: node is stored in our entries map
+                // via a raw pointer, which points to
+                // the same allocation used in the DLL.
+                // We have to be careful to free node
+                // only after removing it from both
+                // the DLL and our entries map.
+                drop(node_box);
+            }
+        }
+
+        while self.main_size > self.main_capacity && self.main_cache.len() > 1 {
+            let node: *mut Node = self.main_cache.pop_tail().unwrap();
+
+            let popped_main: CacheAccess = unsafe { *(*node).inner.get() };
+            let node_size = popped_main.size();
+            let item = popped_main.pid(u8::try_from(shard_idx).unwrap());
+
+            self.main_size -= node_size;
+
+            let pid_bytes = popped_main.pid_bytes;
             assert!(self.entries.remove(&pid_bytes));
 
-            self.size -= node_size;
+            ret.push((item, node_size));
+
+            let node_box: Box<Node> = unsafe { Box::from_raw(node) };
 
             // NB: node is stored in our entries map
             // via a raw pointer, which points to
@@ -376,14 +468,14 @@ impl Shard {
             // We have to be careful to free node
             // only after removing it from both
             // the DLL and our entries map.
-            drop(node);
+            drop(node_box);
         }
     }
 }
 
 #[test]
 fn lru_smoke_test() {
-    let mut lru = CacheAdvisor::new(256);
+    let mut lru = CacheAdvisor::new(256, 50);
     let mut evicted = 0;
     for i in 0..10_000 {
         evicted += lru.accessed(i, 16).len();
@@ -463,4 +555,40 @@ fn probabilistic_n() {
     let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
 
     assert!(abs_delta < 0.005, "delta is actually {}", abs_delta);
+
+    dbg!(resizer.compress(usize::MAX));
+}
+
+#[test]
+fn scan_resistance() {
+    // each shard stores 10 bytes, 10% of that is in the entry cache
+    let mut ca = CacheAdvisor::new(256 * 10, 10);
+
+    // add 0 into entry cache
+    ca.accessed(0, 1);
+
+    // promote 0 into main cache
+    ca.accessed(0, 1);
+
+    // hit other items only once, like a big scan
+    for i in 1..5000 {
+        let id = i * 256;
+        let evicted = ca.accessed(id, 1);
+
+        // assert that 0 is never evicted while scanning
+        assert!(!evicted.contains(&(0, 1)));
+    }
+
+    let mut zero_evicted = false;
+
+    // hit other items more than once, assert that zero does get
+    // evicted eventually.
+    for i in 1..5000 {
+        let id = i * 256;
+        zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+        zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+        zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+    }
+
+    assert!(zero_evicted);
 }

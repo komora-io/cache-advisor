@@ -114,11 +114,7 @@ impl DoublyLinkedList {
         self.head = ptr;
     }
 
-    pub(crate) fn promote(&mut self, ptr: *mut Node) {
-        if self.head == ptr {
-            return;
-        }
-
+    pub(crate) fn unwire(&mut self, ptr: *mut Node) {
         unsafe {
             if self.tail == ptr {
                 self.tail = (*ptr).next;
@@ -129,34 +125,37 @@ impl DoublyLinkedList {
             }
 
             (*ptr).unwire();
-
-            self.push_head_ptr(ptr);
         }
+
+        self.len -= 1;
+    }
+
+    pub(crate) fn install(&mut self, ptr: *mut Node) {
+        self.len += 1;
+        self.push_head_ptr(ptr);
     }
 
     // NB: returns the Box<Node> instead of just the Option<CacheAccess>
     // because the LRU is a map to the Node as well, and if the LRU
     // accessed the map via PID, it would cause a use after free if
     // we had already freed the Node in this function.
-    pub(crate) fn pop_tail(&mut self) -> Option<Box<Node>> {
+    pub(crate) fn pop_tail(&mut self) -> Option<*mut Node> {
         if self.tail.is_null() {
             return None;
         }
 
         self.len -= 1;
+        let tail_ptr = self.tail;
+        if self.head == self.tail {
+            self.head = ptr::null_mut();
+        }
 
         unsafe {
-            let mut tail: Box<Node> = Box::from_raw(self.tail);
+            self.tail = (*tail_ptr).next;
 
-            if self.head == self.tail {
-                self.head = ptr::null_mut();
-            }
-
-            self.tail = tail.next;
-
-            tail.unwire();
-
-            Some(tail)
+            (*tail_ptr).unwire();
         }
+
+        Some(tail_ptr)
     }
 }
