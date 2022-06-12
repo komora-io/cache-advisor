@@ -19,17 +19,17 @@
 //! let mut ca = CacheAdvisor::new(256 * 10, 10);
 //!
 //! // add item 0 into entry cache
-//! let should_evict = ca.accessed(0, 1);
+//! let should_evict = ca.accessed_reuse_buffer(0, 1);
 //! assert!(should_evict.is_empty());
 //!
 //! // promote item 0 into main cache
-//! let should_evict = ca.accessed(0, 1);
+//! let should_evict = ca.accessed_reuse_buffer(0, 1);
 //! assert!(should_evict.is_empty());
 //!
 //! // hit other items only once, like a big scan
 //! for i in 1..5000 {
 //!     let id = i * 256;
-//!     let evicted = ca.accessed(id, 1);
+//!     let evicted = ca.accessed_reuse_buffer(id, 1);
 //!
 //!     // assert that 0 is never evicted while scanning
 //!     assert!(!evicted.contains(&(0, 1)));
@@ -41,9 +41,9 @@
 //! // evicted eventually.
 //! for i in 1..5000 {
 //!     let id = i * 256;
-//!     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
-//!     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
-//!     zero_evicted |= ca.accessed(id, 1).contains(&(0, 1));
+//!     zero_evicted |= ca.accessed_reuse_buffer(id, 1).contains(&(0, 1));
+//!     zero_evicted |= ca.accessed_reuse_buffer(id, 1).contains(&(0, 1));
+//!     zero_evicted |= ca.accessed_reuse_buffer(id, 1).contains(&(0, 1));
 //! }
 //!
 //! assert!(zero_evicted);
@@ -306,6 +306,7 @@ pub struct CacheAdvisor {
     access_queues: Arc<[SegQueue<CacheAccess>]>,
     local_queue: Vec<(u64, usize)>,
     resizer: Resizer,
+    access_buffer: Vec<(u64, usize)>,
 }
 
 const fn _send_sync_ca() {
@@ -357,6 +358,7 @@ impl CacheAdvisor {
             access_queues: access_queues.into(),
             local_queue: Vec::with_capacity(MAX_QUEUE_ITEMS),
             resizer: Resizer::default(),
+            access_buffer: vec![],
         }
     }
 
@@ -364,12 +366,41 @@ impl CacheAdvisor {
     /// evicted. Avoids blocking under contention by using flat-combining
     /// on 256 LRU shards.
     pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<(u64, usize)> {
+        let mut ret = vec![];
+        self.accessed_inner(id, cost, &mut ret);
+        ret
+    }
+
+    /// Similar to `accessed` except this will reuse an internal vector for storing
+    /// items to be evicted, which will be passed by reference to callers. If the
+    /// returned slice is huge and you would like to reclaim underlying memory, call
+    /// the `reset_internal_access_buffer` method. This can improve throughput by around
+    /// 10% in some cases compared to the simpler `accessed` method above (which may
+    /// need to copy items several times as the returned vector is expanded).
+    pub fn accessed_reuse_buffer(&mut self, id: u64, cost: usize) -> &[(u64, usize)] {
+        let mut swapped = std::mem::take(&mut self.access_buffer);
+        swapped.clear();
+        self.accessed_inner(id, cost, &mut swapped);
+        self.access_buffer = swapped;
+        &self.access_buffer
+    }
+
+    /// Resets the internal access buffer, freeing any memory it may have been holding
+    /// onto. This should only be called in combination with `accessed_reuse_buffer` if
+    /// you want to release the memory that the internal buffer may be consuming. You
+    /// probably don't need to call this unless the previous slice returned by
+    /// `accessed_reuse_buffer` is over a few thousand items long, if not an order of magnitude
+    /// or two larger than that, which should ideally be rare events in workloads where
+    /// most items being inserted are somewhat clustered in size.
+    pub fn reset_internal_access_buffer(&mut self) {
+        self.access_buffer = vec![]
+    }
+
+    fn accessed_inner(&mut self, id: u64, cost: usize, ret: &mut Vec<(u64, usize)>) {
         self.local_queue.push((id, cost));
 
-        let mut ret = vec![];
-
         if self.local_queue.len() < MAX_QUEUE_ITEMS {
-            return ret;
+            return;
         }
 
         while let Some((id, cost)) = self.local_queue.pop() {
@@ -386,17 +417,15 @@ impl CacheAdvisor {
                 // back to our own work eventually.
                 for _ in 0..access_queue.len() {
                     if let Some(queued_cache_access) = access_queue.pop() {
-                        shard.accessed(queued_cache_access, shard_idx, &mut ret);
+                        shard.accessed(queued_cache_access, shard_idx, ret);
                     }
                 }
 
-                shard.accessed(cache_access, shard_idx, &mut ret);
+                shard.accessed(cache_access, shard_idx, ret);
             } else {
                 access_queue.push(cache_access);
             }
         }
-
-        ret
     }
 }
 
