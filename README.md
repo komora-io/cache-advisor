@@ -1,22 +1,21 @@
-# berghain
-
-an efficient scan-resistant cache manager for hot objects.
-
-this is not a cache. it is just the thing that tells you what can stay and what needs to go.
+# cache-advisor
 
 API:
 
 ```rust
-/// create a bouncer that will lazily evict
-/// items after crossing the 4096 cost limit
-let mut bouncer = berghain::Bouncer::new(4096);
+impl CacheAdvisor {
+  /// Create a new advisor.
+  pub fn new(capacity: usize) -> CacheAdvisor { .. }
 
-impl Bouncer {
-  /// returns the items that should be evicted
-  pub fn accessed(
-    &mut self,
-    item: u64,
-    cost: usize
-  ) -> Vec<u64>
+  /// Mark items that are accessed with a certain cost.
+  /// Returns the items that should be evicted and their associated costs
+  pub fn accessed(&mut self, id: u64, cost: usize) -> Vec<(u64, usize)> { .. }
 }
 ```
+
+Implementation details:
+* pushes accesses to a local queue
+* when the local queue reaches 8 items, pushes each access into one of 256 shards
+* each shard is protected by a mutex, but it never blocks to lock it, by using `try_lock`
+* if the mutex can't be acquired, the accesses are pushed into an access queue for the shard
+* if the mutex can be acquired, the acquiring thread applies accesses from the queue as well

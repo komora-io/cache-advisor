@@ -1,26 +1,29 @@
 use cache_advisor::CacheAdvisor;
 use std::sync::atomic;
 
-const N_THREADS: usize = 8;
 const OPS: usize = 100_000_000;
-const OPS_PER_THREAD: usize = OPS / N_THREADS;
-const SZ: usize = 1;
+const SZ: usize = 9;
 const CAP: usize = 1024 * 1024;
 
 static EVICTED_BYTES: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
 fn main() {
+    let n_threads: usize = std::thread::available_parallelism()
+        .unwrap_or(8.try_into().unwrap())
+        .get();
+
+    let ops_per_thread: usize = OPS / n_threads;
     let cache_advisor = CacheAdvisor::new(CAP);
 
     let mut threads = vec![];
 
     let before = std::time::Instant::now();
 
-    for tn in 0..N_THREADS {
+    for tn in 0..n_threads {
         let mut cache_advisor = cache_advisor.clone();
-        let base = tn * OPS_PER_THREAD;
+        let base = tn * ops_per_thread;
         let thread = std::thread::spawn(move || {
-            for i in 0..OPS_PER_THREAD {
+            for i in 0..ops_per_thread {
                 let id = base + i;
                 let evicted = cache_advisor.accessed(id as u64, SZ);
                 let cost = evicted.iter().map(|(_id, cost)| cost).sum();
@@ -44,6 +47,6 @@ fn main() {
         evicted / 1_000_000,
         present / 1_000_000,
         (100 * present.saturating_sub(CAP)) / CAP,
-        OPS as f64 / before.elapsed().as_secs() as f64 / 1_000_000.,
+        (OPS * 1000) as f64 / before.elapsed().as_millis() as f64 / 1_000_000.,
     );
 }

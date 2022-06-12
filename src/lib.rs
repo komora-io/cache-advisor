@@ -1,8 +1,7 @@
 use std::{
-    borrow::{Borrow, BorrowMut},
+    borrow::Borrow,
     cell::UnsafeCell,
     hash::{Hash, Hasher},
-    num::Wrapping,
     ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,11 +12,13 @@ use std::{
 use crossbeam_queue::SegQueue;
 
 mod dll;
+//mod dll2;
 
 use crate::dll::{DoublyLinkedList, Node};
 
 const MAX_QUEUE_ITEMS: usize = 8;
-
+const RESIZE_CUTOFF: usize = 8;
+const RESIZE_CUTOFF_U8: u8 = RESIZE_CUTOFF as u8;
 const N_SHARDS: usize = 256;
 
 // very very simple mutex that reduces instruction cache pollution
@@ -75,54 +76,49 @@ impl<'a, T> DerefMut for TryMutexGuard<'a, T> {
     }
 }
 
-#[derive(Clone)]
-struct Rng(Wrapping<u32>);
+#[derive(Clone, Default)]
+struct Resizer {
+    actual: u128,
+    decompressed: u128,
+}
 
-impl Rng {
-    #[inline]
-    fn bool_with_probability(&mut self, pct: u8) -> bool {
-        assert!(pct <= 100);
-
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-
-        self.0 = x;
-
-        let rand = ((x.0 as u64).wrapping_mul(100) >> 32) as u32;
-
-        rand < pct as u32
-    }
-
+impl Resizer {
     /// Returns a compressed size which
     /// has been probabilistically chosen.
-    fn probabilistic_size(&mut self, input: usize) -> u8 {
-        if input <= 2 {
-            return u8::try_from(input).unwrap();
-        };
+    fn compress(&mut self, raw_input: usize) -> u8 {
+        if raw_input < RESIZE_CUTOFF {
+            return u8::try_from(raw_input).unwrap();
+        }
 
-        let po2 = input.next_power_of_two();
-        let err = po2 - input;
-        let probability_to_downshift = (err * 200) / po2;
+        let upgraded_input = u128::try_from(raw_input).unwrap();
+        let po2 = upgraded_input.next_power_of_two();
+        let compressed = po2.trailing_zeros() as u8;
+        let decompressed = decompress(compressed) as u128;
+        self.actual += raw_input as u128;
 
-        assert!(probability_to_downshift < 100);
-
-        let maybe_downshifted = if self.bool_with_probability(probability_to_downshift as u8) {
-            assert_ne!(probability_to_downshift, 0);
-            po2 >> 1
+        let ret = if self.decompressed + decompressed > self.actual {
+            compressed - 1
         } else {
-            po2
+            compressed
         };
 
-        maybe_downshifted.trailing_zeros() as u8
+        self.decompressed += decompress(ret) as u128;
+
+        ret + RESIZE_CUTOFF_U8
     }
 }
 
-const fn probabilistic_unsize(input: u8) -> usize {
+#[inline]
+const fn decompress(input: u8) -> usize {
     match input {
-        0..=2 => input as usize,
-        i => 1 << i,
+        0..=RESIZE_CUTOFF_U8 => input as usize,
+        _ => {
+            if let Some(o) = 1_usize.checked_shl((input - RESIZE_CUTOFF_U8) as u32) {
+                o
+            } else {
+                usize::MAX
+            }
+        }
     }
 }
 
@@ -171,7 +167,7 @@ pub(crate) struct CacheAccess {
 
 impl CacheAccess {
     fn size(&self) -> usize {
-        probabilistic_unsize((self.size) as u8)
+        decompress((self.size) as u8)
     }
 
     fn pid(&self, shard: u8) -> PageId {
@@ -181,8 +177,8 @@ impl CacheAccess {
         PageId::from_le_bytes(pid_bytes)
     }
 
-    fn new(pid: PageId, sz: usize, rng: &mut Rng) -> CacheAccess {
-        let size = rng.probabilistic_size(sz);
+    fn new(pid: PageId, sz: usize, rng: &mut Resizer) -> CacheAccess {
+        let size = rng.compress(sz);
 
         let mut pid_bytes = [0; 7];
         pid_bytes.copy_from_slice(&pid.to_le_bytes()[1..8]);
@@ -197,7 +193,7 @@ pub struct CacheAdvisor {
     shards: Arc<[TryMutex<Shard>]>,
     access_queues: Arc<[SegQueue<CacheAccess>]>,
     local_queue: Vec<(u64, usize)>,
-    rng: Rng,
+    rng: Resizer,
 }
 
 impl CacheAdvisor {
@@ -224,7 +220,7 @@ impl CacheAdvisor {
             shards: shards.into(),
             access_queues: access_queues.into(),
             local_queue: Vec::with_capacity(MAX_QUEUE_ITEMS),
-            rng: Rng(Wrapping(1406868647)),
+            rng: Resizer::default(),
         }
     }
 
@@ -290,18 +286,6 @@ impl PartialOrd<Entry> for Entry {
 impl PartialEq for Entry {
     fn eq(&self, other: &Entry) -> bool {
         unsafe { (*self.0).pid_bytes == (*other.0).pid_bytes }
-    }
-}
-
-impl BorrowMut<CacheAccess> for Entry {
-    fn borrow_mut(&mut self) -> &mut CacheAccess {
-        unsafe { &mut *self.0 }
-    }
-}
-
-impl Borrow<CacheAccess> for Entry {
-    fn borrow(&self) -> &CacheAccess {
-        unsafe { &*self.0 }
     }
 }
 
@@ -400,21 +384,74 @@ impl Shard {
 #[test]
 fn lru_smoke_test() {
     let mut lru = CacheAdvisor::new(256);
-    for i in 0..1000 {
-        lru.accessed(i, 16);
+    let mut evicted = 0;
+    for i in 0..10_000 {
+        evicted += lru.accessed(i, 16).len();
     }
+    assert!(evicted > 9700, "only evicted {} items", evicted);
+}
+
+#[test]
+fn probabilistic_sum() {
+    let mut rng = Resizer::default();
+    let mut resized = 0;
+    let mut actual = 0;
+    for i in 0..1000 {
+        let compressed = rng.compress(i);
+        let decompressed = decompress(compressed);
+        resized += decompressed;
+        actual += i;
+    }
+
+    let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
+
+    assert!(abs_delta < 0.005, "delta is actually {}", abs_delta);
 }
 
 #[test]
 fn probabilistic_ev() {
-    let mut rng = Rng(Wrapping(1406868647));
+    let mut rng = Resizer::default();
+
+    for i in 0..1024 {
+        let mut resized = 0;
+        let mut actual = 0;
+        for _ in 1..10000 {
+            let compressed = rng.compress(i);
+            let decompressed = decompress(compressed);
+            resized += decompressed;
+            actual += i;
+        }
+
+        if i == 0 {
+            assert_eq!(actual, 0);
+            assert_eq!(resized, 0);
+        } else {
+            let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();
+            assert!(
+                abs_delta < 0.005,
+                "delta is actually {} for inputs of size {}. actual: {} round-trip: {}",
+                abs_delta,
+                i,
+                actual,
+                resized
+            );
+        }
+    }
+}
+
+#[test]
+fn probabilistic_n() {
+    const N: usize = 15;
+
+    let mut rng = Resizer::default();
     let mut resized = 0;
     let mut actual = 0;
-    for i in 0..1000 {
-        let compressed = rng.probabilistic_size(i);
-        let decompressed = probabilistic_unsize(compressed);
+
+    for _ in 0..1000 {
+        let compressed = rng.compress(N);
+        let decompressed = decompress(compressed);
         resized += decompressed;
-        actual += i;
+        actual += N;
     }
 
     let abs_delta = ((resized as f64 / actual as f64) - 1.).abs();

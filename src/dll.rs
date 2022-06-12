@@ -20,12 +20,6 @@ impl std::ops::Deref for Node {
     }
 }
 
-impl std::ops::DerefMut for Node {
-    fn deref_mut(&mut self) -> &mut CacheAccess {
-        unsafe { &mut (*self.inner.get()) }
-    }
-}
-
 impl Node {
     fn unwire(&mut self) {
         unsafe {
