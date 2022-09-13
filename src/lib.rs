@@ -309,6 +309,13 @@ pub struct CacheAdvisor {
     access_buffer: Vec<(u64, usize)>,
 }
 
+impl Default for CacheAdvisor {
+    /// Returns a `CacheAdvisor` with a default of 1 million capacity, and 20% entry cache
+    fn default() -> CacheAdvisor {
+        CacheAdvisor::new(1024 * 1024, 20)
+    }
+}
+
 const fn _send_sync_ca() {
     const fn send_sync<T: Send + Sync>() {}
     send_sync::<CacheAdvisor>();
