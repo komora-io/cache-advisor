@@ -51,6 +51,7 @@
 use std::{
     borrow::Borrow,
     cell::UnsafeCell,
+    fmt,
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut},
     sync::{
@@ -307,6 +308,12 @@ pub struct CacheAdvisor {
     local_queue: Vec<(u64, usize)>,
     resizer: Resizer,
     access_buffer: Vec<(u64, usize)>,
+}
+
+impl fmt::Debug for CacheAdvisor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CacheAdvisor").finish()
+    }
 }
 
 impl Default for CacheAdvisor {
