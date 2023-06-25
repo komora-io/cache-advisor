@@ -1,9 +1,9 @@
 [package]
 name = "cache-advisor"
-version = "1.0.13"
+version = "1.0.14"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "scan-resistant concurrent cache eviction manager"
-license = "GPL-3.0"
+license = "MIT/Apache-2.0"
 homepage = "https://github.com/komora-io/cache-advisor"
 repository = "https://github.com/komora-io/cache-advisor"
 keywords = ["cache", "lfu", "concurrent", "caching", "lock-free"]
