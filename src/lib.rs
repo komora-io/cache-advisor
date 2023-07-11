@@ -301,13 +301,24 @@ impl CacheAccess {
 ///
 /// assert!(zero_evicted);
 /// ```
-#[derive(Clone)]
 pub struct CacheAdvisor {
     shards: Arc<[TryMutex<Shard>]>,
     access_queues: Arc<[SegQueue<CacheAccess>]>,
     local_queue: Vec<(u64, usize)>,
     resizer: Resizer,
     access_buffer: Vec<(u64, usize)>,
+}
+
+impl Clone for CacheAdvisor {
+    fn clone(&self) -> CacheAdvisor {
+        CacheAdvisor {
+            shards: self.shards.clone(),
+            access_queues: self.access_queues.clone(),
+            local_queue: vec![],
+            resizer: self.resizer.clone(),
+            access_buffer: vec![],
+        }
+    }
 }
 
 impl fmt::Debug for CacheAdvisor {
